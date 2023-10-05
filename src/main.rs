@@ -51,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = app.get_matches();
        
     let kafka_broker = matches.value_of("KAFKA_BROKER").unwrap_or("localhost:9092").to_string();
-    let kafka_topic = Arc::new(matches.value_of("KAFKA_TOPIC").unwrap_or("wzgelf").to_string());
+    let kafka_topic = Arc::new(matches.value_of("KAFKA_TOPIC").unwrap_or("gelf_messages").to_string());
     let gelf_listen = matches.value_of("GELF_LISTEN_ADDR").unwrap_or("0.0.0.0:12201").to_string();
     let verbose = matches.is_present("VERBOSE");
 
@@ -69,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cloned_kafka_topic = kafka_topic.clone();
   
         tokio::spawn(async move {
-            let mut buffer = vec![0u8; 4096];
+            let mut buffer = vec![0u8; 65536];
             loop {
                 match socket.read(&mut buffer).await {
                     Ok(0) => return, // Connexion fermée
