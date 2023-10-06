@@ -25,10 +25,14 @@ jobs:
           target: ${{ matrix.arch }}-unknown-${{ matrix.os == 'windows-latest' && 'pc-windows-msvc' || matrix.os == 'macos-latest' && 'apple-darwin' || 'linux-gnu' }}
           override: true
 
+      - name: Install cross
+        run: cargo install cross
+
       - name: Build
         uses: actions-rs/cargo@v1
         with:
           command: build
+          use-cross: true
           args: --release --target ${{ matrix.arch }}-unknown-${{ matrix.os == 'windows-latest' && 'pc-windows-msvc' || matrix.os == 'macos-latest' && 'apple-darwin' || 'linux-gnu' }}
 
       - name: Upload artifact
