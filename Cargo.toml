@@ -10,3 +10,5 @@ tokio = { version = "1", features = ["full"] }
 rdkafka = { version = "0.34.0", features = ["tokio"] }
 uuid = { version = "1.4.1", features = ["v4"] }
 clap = "2.34.0"
+warp = "0.3"
+bytes = "1.0"

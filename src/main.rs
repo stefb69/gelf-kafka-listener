@@ -1,6 +1,5 @@
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::ClientConfig;
-use tokio::net::TcpListener;
 use tokio::io::AsyncReadExt;
 use std::time::Duration;
 use uuid::Uuid;
@@ -45,6 +44,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .required(false)
             .takes_value(false)
             .help("Affiche les messages de log sur stdout"),
+    )
+    .arg(
+        Arg::with_name("LISTENER_TYPE")
+            .short("t")
+            .long("type")
+            .value_name("LISTENER_TYPE")
+            .help("Type of listener: tcp, udp, or http. Default is tcp.")
+            .takes_value(true),
     );
 
 
@@ -52,8 +59,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
        
     let kafka_broker = matches.value_of("KAFKA_BROKER").unwrap_or("localhost:9092").to_string();
     let kafka_topic = Arc::new(matches.value_of("KAFKA_TOPIC").unwrap_or("gelf_messages").to_string());
-    let gelf_listen = matches.value_of("GELF_LISTEN_ADDR").unwrap_or("0.0.0.0:12201").to_string();
+    let gelf_listen = Arc::new(matches.value_of("GELF_LISTEN_ADDR").unwrap_or("0.0.0.0:12201").to_string());
     let verbose = matches.is_present("VERBOSE");
+    let listener_type = matches.value_of("LISTENER_TYPE").unwrap_or("tcp");
 
     // let cloned_kafka_topic = kafka_topic.as_str().clone(); // Pour le spawn
     // Configuration Kafka
@@ -61,31 +69,102 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set("bootstrap.servers", kafka_broker)
         .create().expect("Producer creation error");
 
-    // Écouteur TCP
-    let listener = TcpListener::bind(gelf_listen).await?;
-    loop {
-        let (mut socket, _) = listener.accept().await?;
-        let producer_clone = producer.clone();
-        let cloned_kafka_topic = kafka_topic.clone();
-  
-        tokio::spawn(async move {
-            let mut buffer = vec![0u8; 65536];
+    match listener_type {
+        "tcp" => {        
+            // Écouteur TCP
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind(&*gelf_listen).await.expect("Failed to bind TCP listener");
+            println!("Listening on: {}", gelf_listen);
             loop {
-                match socket.read(&mut buffer).await {
-                    Ok(0) => return, // Connexion fermée
-                    Ok(n) => {
+                let (mut socket, _) = listener.accept().await.expect("Failed to accept TCP connection");
+                let producer_clone = producer.clone();
+                let cloned_kafka_topic = kafka_topic.clone();
+        
+                tokio::spawn(async move {
+                    let mut buffer = vec![0u8; 65536];
+                    loop {
+                        match socket.read(&mut buffer).await {
+                            Ok(0) => return, // Connexion fermée
+                            Ok(n) => {
+                                let key = Uuid::new_v4().to_string();
+                                let record = FutureRecord::to(cloned_kafka_topic.as_str())
+                                    .key(&key)
+                                    .payload(&buffer[..n]);
+                                let _ = producer_clone.send(record, Duration::from_secs(5)).await;
+                                if verbose {
+                                    println!("Message envoyé sur Kafka: {}", key);
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                });
+            }
+        },
+        "udp" => {
+            use tokio::net::UdpSocket;
+
+            let socket = UdpSocket::bind(&*gelf_listen).await.expect("Failed to bind UDP socket");
+            println!("Listening on UDP: {}", gelf_listen);
+        
+            loop {
+                let mut buffer = vec![0u8; 65536];
+                let (size, _) = socket.recv_from(&mut buffer).await.expect("Failed to read from UDP socket");
+        
+                let producer_clone = producer.clone();
+                let cloned_kafka_topic = kafka_topic.clone();
+        
+                tokio::spawn(async move {
+                    let key = Uuid::new_v4().to_string();
+                    let record = FutureRecord::to(cloned_kafka_topic.as_str())
+                        .key(&key)
+                        .payload(&buffer[..size]);
+                    let _ = producer_clone.send(record, Duration::from_secs(5)).await;
+                    if verbose {
+                        println!("Message envoyé sur Kafka via UDP: {}", key);
+                    }
+                });
+            }
+        },
+        "http" => {
+            use warp::Filter;
+
+            // Define a warp filter that handles POST requests to "/"
+            let gelf = warp::post()
+                .and(warp::path::end())
+                .and(warp::body::bytes())
+                .map(move |data: bytes::Bytes| {
+
+                    // Here, data contains the body of the POST request.
+                    // You can send this data to Kafka as you do for the TCP listener.
+        
+                    let producer_clone = producer.clone();
+                    let cloned_kafka_topic = kafka_topic.clone();
+        
+                    tokio::spawn(async move {
                         let key = Uuid::new_v4().to_string();
+                        let binding = data.to_vec();
                         let record = FutureRecord::to(cloned_kafka_topic.as_str())
                             .key(&key)
-                            .payload(&buffer[..n]);
+                            .payload(&binding);
                         let _ = producer_clone.send(record, Duration::from_secs(5)).await;
                         if verbose {
                             println!("Message envoyé sur Kafka: {}", key);
                         }
-                    }
-                    Err(_) => return,
-                }
-            }
-        });
+                    });
+        
+                    warp::reply::with_status("Received", warp::http::StatusCode::OK)
+                });
+        
+            let addr: std::net::SocketAddr = (&*gelf_listen).parse().expect("Failed to parse listening address");
+            // Start the warp server on the specified address
+            warp::serve(gelf).run(addr).await;
+        },
+        _ => {
+            eprintln!("Unsupported listener type: {}", listener_type);
+            std::process::exit(1);
+        }
     }
+    Ok(())
 }
