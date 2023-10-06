@@ -5,6 +5,7 @@ use std::time::Duration;
 use uuid::Uuid;
 use clap::{App, Arg};
 use std::sync::Arc;
+use daemonize::Daemonize;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -46,11 +47,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .help("Affiche les messages de log sur stdout"),
     )
     .arg(
-        Arg::with_name("LISTENER_TYPE")
-            .short("t")
-            .long("type")
-            .value_name("LISTENER_TYPE")
-            .help("Type of listener: tcp, udp, or http. Default is tcp.")
+        Arg::with_name("LISTENER_PROTO")
+            .short("p")
+            .long("protocol")
+            .value_name("LISTENER_PROTO")
+            .help("Protcol of the listener: tcp, udp, or http. Default is tcp.")
+            .takes_value(true),
+    ).arg(
+        Arg::with_name("daemonize")
+            .short("d")
+            .long("daemonize")
+            .help("Détache le programme et enregistre les logs dans /tmp/gelf-kafka-listener.out et /tmp/gelf-kafka-listener.err")
+    ).arg(
+        Arg::with_name("log-path-prefix")
+            .short("L")
+            .long("log-path-prefix")
+            .value_name("LOG_PATH_PREFIX")
+            .help("Préfixe du chemin pour les fichiers de logs (par défaut : /tmp)")
             .takes_value(true),
     );
 
@@ -61,9 +74,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let kafka_topic = Arc::new(matches.value_of("KAFKA_TOPIC").unwrap_or("gelf_messages").to_string());
     let gelf_listen = Arc::new(matches.value_of("GELF_LISTEN_ADDR").unwrap_or("0.0.0.0:12201").to_string());
     let verbose = matches.is_present("VERBOSE");
-    let listener_type = matches.value_of("LISTENER_TYPE").unwrap_or("tcp");
+    let listener_type = matches.value_of("LISTENER_PROTO").unwrap_or("tcp");
+    let log_path_prefix = matches.value_of("log-path-prefix").unwrap_or("/tmp");
 
-    // let cloned_kafka_topic = kafka_topic.as_str().clone(); // Pour le spawn
+    if matches.is_present("daemonize") {
+        use std::fs::File;
+        let log_filename = format!("gelf-kafka-listener_{}_{}_{}.out", listener_type, gelf_listen.replace(":", "-"), kafka_topic);
+        let err_filename = format!("gelf-kafka-listener_{}_{}_{}.err", listener_type, gelf_listen.replace(":", "-"), kafka_topic);
+        let pid_filename = format!("gelf-kafka-listener_{}_{}_{}.pid", listener_type, gelf_listen.replace(":", "-"), kafka_topic);
+        let stdout_path = format!("{}/{}", log_path_prefix, log_filename);
+        let stderr_path = format!("{}/{}", log_path_prefix, err_filename);
+        let pid_file = format!("{}/{}", log_path_prefix, pid_filename);
+        
+        let stdout = File::create(stdout_path).unwrap();
+        let stderr = File::create(stderr_path).unwrap();
+    
+        let daemonize = Daemonize::new()
+            .pid_file(pid_file) // Emplacement du fichier PID
+            .chown_pid_file(true)                     // Change le propriétaire du fichier PID
+            .working_directory(log_path_prefix)                // Répertoire de travail
+            .stdout(stdout)                          // Redirige stdout vers un fichier
+            .stderr(stderr)                          // Redirige stderr vers un fichier
+            .privileged_action(|| "Executed before drop privileges");
+    
+        match daemonize.start() {
+            Ok(_) => println!("Démarrage réussi"),
+            Err(e) => eprintln!("Erreur : {}", e),
+        }
+    }
+
+    // let kafka_topic_clone = kafka_topic.as_str().clone(); // Pour le spawn
     // Configuration Kafka
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", kafka_broker)
@@ -79,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 let (mut socket, _) = listener.accept().await.expect("Failed to accept TCP connection");
                 let producer_clone = producer.clone();
-                let cloned_kafka_topic = kafka_topic.clone();
+                let kafka_topic_clone = kafka_topic.clone();
         
                 tokio::spawn(async move {
                     let mut buffer = vec![0u8; 65536];
@@ -88,12 +128,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(0) => return, // Connexion fermée
                             Ok(n) => {
                                 let key = Uuid::new_v4().to_string();
-                                let record = FutureRecord::to(cloned_kafka_topic.as_str())
+                                let record = FutureRecord::to(kafka_topic_clone.as_str())
                                     .key(&key)
                                     .payload(&buffer[..n]);
                                 let _ = producer_clone.send(record, Duration::from_secs(5)).await;
                                 if verbose {
-                                    println!("Message envoyé sur Kafka: {}", key);
+                                    println!("Message tcp envoyé sur Kafka: {}", key);
                                 }
                             }
                             Err(_) => return,
@@ -113,16 +153,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let (size, _) = socket.recv_from(&mut buffer).await.expect("Failed to read from UDP socket");
         
                 let producer_clone = producer.clone();
-                let cloned_kafka_topic = kafka_topic.clone();
+                let kafka_topic_clone = kafka_topic.clone();
         
                 tokio::spawn(async move {
                     let key = Uuid::new_v4().to_string();
-                    let record = FutureRecord::to(cloned_kafka_topic.as_str())
+                    let record = FutureRecord::to(kafka_topic_clone.as_str())
                         .key(&key)
                         .payload(&buffer[..size]);
                     let _ = producer_clone.send(record, Duration::from_secs(5)).await;
                     if verbose {
-                        println!("Message envoyé sur Kafka via UDP: {}", key);
+                        println!("Message udp envoyé sur Kafka via UDP: {}", key);
                     }
                 });
             }
@@ -132,7 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Define a warp filter that handles POST requests to "/"
             let gelf = warp::post()
-                .and(warp::path::end())
+                .and(warp::path("gelf"))
                 .and(warp::body::bytes())
                 .map(move |data: bytes::Bytes| {
 
@@ -140,17 +180,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // You can send this data to Kafka as you do for the TCP listener.
         
                     let producer_clone = producer.clone();
-                    let cloned_kafka_topic = kafka_topic.clone();
+                    let kafka_topic_clone = kafka_topic.clone();
         
                     tokio::spawn(async move {
                         let key = Uuid::new_v4().to_string();
                         let binding = data.to_vec();
-                        let record = FutureRecord::to(cloned_kafka_topic.as_str())
+                        let record = FutureRecord::to(kafka_topic_clone.as_str())
                             .key(&key)
                             .payload(&binding);
                         let _ = producer_clone.send(record, Duration::from_secs(5)).await;
                         if verbose {
-                            println!("Message envoyé sur Kafka: {}", key);
+                            println!("Message http envoyé sur Kafka: {}", key);
                         }
                     });
         
